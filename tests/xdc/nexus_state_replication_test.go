@@ -23,6 +23,7 @@ import (
 	historypb "go.temporal.io/api/history/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/operatorservice/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -812,6 +813,62 @@ func (s *NexusStateReplicationSuite) TestChasmTokenCompletesHSMOperationAfterRes
 
 	op := s.setupMixedFlagChasmOperation()
 	s.completeTokenAfterFailoverResetToHSM(op, "CHASM token to HSM completion after nonzero failover")
+}
+
+// TestAdminRebuildMutableStateForGlobalNamespaceLeavesPassiveCHASMState characterizes the recovery
+// boundary for a global namespace. RebuildMutableState can realign the active cluster to HSM, but
+// the rebuilt snapshot is not replicated and the passive cluster rejects an explicit rebuild. A
+// subsequent terminal history event replicates without clearing the passive CHASM operation.
+func (s *NexusStateReplicationSuite) TestAdminRebuildMutableStateForGlobalNamespaceLeavesPassiveCHASMState() {
+	if !s.chasmEnabled {
+		s.T().Skip("cross-framework scenario starts with a CHASM operation")
+	}
+
+	op := s.setupMixedFlagChasmOperation()
+	namespaceDescription := s.describeNamespace(s.T(), s.clusters[1], op.ns, true)
+	s.Positive(namespaceDescription.GetFailoverVersion())
+	execution := &commonpb.WorkflowExecution{WorkflowId: op.run.GetID(), RunId: op.run.GetRunID()}
+
+	for _, cluster := range s.clusters {
+		cluster.OverrideDynamicConfig(s.T(), chasmnexusoperation.EnableChasmWorkflowOperations, true)
+		cluster.OverrideDynamicConfig(s.T(), chasmnexusoperation.ChasmWorkflowOperationsRolloutPercent, 0)
+	}
+
+	// Advance the history on the new active cluster. Without a post-failover event, the rebuilt
+	// mutable state's last write version still belongs to the former active cluster and the
+	// active-cluster rebuild is rejected as a passive write.
+	pollRes := s.pollWorkflowTask(op.ctx, s.clusters[1].FrontendClient(), op.ns)
+	_, err := s.clusters[1].FrontendClient().RespondWorkflowTaskCompleted(op.ctx, &workflowservice.RespondWorkflowTaskCompletedRequest{
+		TaskToken: pollRes.TaskToken,
+	})
+	s.NoError(err)
+
+	// Cluster 1 is active after setupMixedFlagChasmOperation fails the namespace over to it.
+	_, err = s.clusters[1].AdminClient().RebuildMutableState(op.ctx, &adminservice.RebuildMutableStateRequest{
+		Namespace: op.ns,
+		Execution: execution,
+	})
+	s.NoError(err)
+	s.assertOperationInHSMTree(op.ctx, s.clusters[1], op.ns, execution, op.scheduledEventID)
+	// The rebuilt snapshot is local and must not silently mutate the passive cluster.
+	s.assertOperationInChasmTree(op.ctx, s.clusters[0], op.ns, execution, op.scheduledEventID)
+
+	_, err = s.clusters[0].AdminClient().RebuildMutableState(op.ctx, &adminservice.RebuildMutableStateRequest{
+		Namespace: op.ns,
+		Execution: execution,
+	})
+	var notActive *serviceerror.NamespaceNotActive
+	s.ErrorAs(err, &notActive)
+	s.assertOperationInChasmTree(op.ctx, s.clusters[0], op.ns, execution, op.scheduledEventID)
+
+	s.completeNexusOperation(op.ctx, "result", op.publicCallbackURL, op.callbackToken)
+	s.waitEvent(op.ctx, op.targetClient, op.run, enumspb.EVENT_TYPE_NEXUS_OPERATION_COMPLETED)
+	s.waitEvent(op.ctx, op.sourceClient, op.run, enumspb.EVENT_TYPE_NEXUS_OPERATION_COMPLETED)
+	passiveDescription, err := op.sourceClient.DescribeWorkflowExecution(op.ctx, op.run.GetID(), op.run.GetRunID())
+	s.NoError(err)
+	s.Len(passiveDescription.PendingNexusOperations, 1)
+	s.Equal(op.scheduledEventID, passiveDescription.PendingNexusOperations[0].ScheduledEventId)
+	s.completeWorkflow(op)
 }
 
 func (s *NexusStateReplicationSuite) completeTokenAfterFailoverResetToHSM(op mixedFlagOperation, reason string) {

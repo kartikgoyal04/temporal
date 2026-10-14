@@ -2,10 +2,12 @@ package tests
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	sdkclient "go.temporal.io/sdk/client"
@@ -13,15 +15,25 @@ import (
 	"go.temporal.io/server/api/adminservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
+	chasmnexus "go.temporal.io/server/chasm/lib/nexusoperation"
 	"go.temporal.io/server/common/dynamicconfig"
+	commonnexus "go.temporal.io/server/common/nexus"
+	"go.temporal.io/server/common/nexus/nexusrpc"
+	"go.temporal.io/server/common/nexus/nexustest"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/common/testing/testvars"
+	"go.temporal.io/server/service/history/hsm/nexusoperations"
 	"go.temporal.io/server/tests/testcore"
 )
 
 type AdminTestSuite struct {
 	parallelsuite.Suite[*AdminTestSuite]
+}
+
+type adminRebuildNexusCallback struct {
+	url   string
+	token string
 }
 
 func TestAdminRebuildMutableState_ChasmDisabled(t *testing.T) {
@@ -142,6 +154,493 @@ func (s *AdminTestSuite) TestAdminRebuildMutableState(testWithChasm bool) {
 	)
 	s.Nil(response1.DatabaseMutableState.ExecutionInfo.MutableStateRebuildTime)
 	s.NotNil(response2.DatabaseMutableState.ExecutionInfo.MutableStateRebuildTime)
+}
+
+func (s *AdminTestSuite) TestAdminRebuildMutableStateRealignsNexusOperationToHSM(testWithChasm bool) {
+	if !testWithChasm {
+		s.T().Skip("test requires a CHASM-backed Nexus operation before the rebuild")
+	}
+
+	env := s.newAdminRebuildNexusEnv()
+	ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+	defer cancel()
+
+	callbackInfoCh := make(chan adminRebuildNexusCallback, 1)
+	endpointName := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(
+			_ context.Context,
+			_ string,
+			_ string,
+			_ *nexus.LazyValue,
+			options nexus.StartOperationOptions,
+		) (nexus.HandlerStartOperationResult[any], error) {
+			select {
+			case callbackInfoCh <- adminRebuildNexusCallback{
+				url:   options.CallbackURL,
+				token: options.CallbackHeader.Get(commonnexus.CallbackTokenHeader),
+			}:
+			default:
+			}
+			return &nexus.HandlerStartOperationResultAsync{OperationToken: "test-operation-token"}, nil
+		},
+	})
+
+	const awaitStartedUpdate = "await-started"
+	workflowFn := func(ctx workflow.Context) (string, error) {
+		started := false
+		if err := workflow.SetUpdateHandler(ctx, awaitStartedUpdate, func(ctx workflow.Context) error {
+			return workflow.Await(ctx, func() bool { return started })
+		}); err != nil {
+			return "", err
+		}
+
+		client := workflow.NewNexusClient(endpointName, "service")
+		future := client.ExecuteOperation(ctx, "operation", "input", workflow.NexusOperationOptions{})
+		var execution workflow.NexusOperationExecution
+		if err := future.GetNexusOperationExecution().Get(ctx, &execution); err != nil {
+			return "", err
+		}
+		started = true
+
+		var result string
+		if err := future.Get(ctx, &result); err != nil {
+			return "", err
+		}
+		return result, nil
+	}
+	env.SdkWorker().RegisterWorkflow(workflowFn)
+
+	run, err := env.SdkClient().ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID:        testvars.New(s.T()).Any().String(),
+		TaskQueue: env.WorkerTaskQueue(),
+	}, workflowFn)
+	s.NoError(err)
+
+	startedHandle, err := env.SdkClient().UpdateWorkflow(ctx, sdkclient.UpdateWorkflowOptions{
+		WorkflowID:   run.GetID(),
+		RunID:        run.GetRunID(),
+		UpdateName:   awaitStartedUpdate,
+		WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
+	})
+	s.NoError(err)
+	s.NoError(startedHandle.Get(ctx, nil))
+
+	callback := s.Rcv(callbackInfoCh)
+	s.NotEmpty(callback.url)
+	s.NotEmpty(callback.token)
+	execution := &commonpb.WorkflowExecution{WorkflowId: run.GetID(), RunId: run.GetRunID()}
+	opID := s.assertAdminRebuildNexusOperationTree(ctx, env, execution, false)
+
+	s.rebuildAdminNexusOperationToHSM(ctx, env, execution)
+
+	s.Equal(opID, s.assertAdminRebuildNexusOperationTree(ctx, env, execution, true))
+	desc, err := env.SdkClient().DescribeWorkflowExecution(ctx, run.GetID(), run.GetRunID())
+	s.NoError(err)
+	s.Len(desc.PendingNexusOperations, 1)
+	s.Equal(enumspb.PENDING_NEXUS_OPERATION_STATE_STARTED, desc.PendingNexusOperations[0].State)
+
+	s.sendAdminRebuildNexusCompletion(ctx, callback, nexusrpc.CompleteOperationOptions{
+		Result: testcore.MustToPayload(s.T(), "result"),
+	})
+
+	var result string
+	s.NoError(run.Get(ctx, &result))
+	s.Equal("result", result)
+}
+
+func (s *AdminTestSuite) TestAdminRebuildMutableStateRealignsNexusOperationWhileStartIsInFlight(testWithChasm bool) {
+	if !testWithChasm {
+		s.T().Skip("test requires a CHASM-backed Nexus operation before the rebuild")
+	}
+
+	env := s.newAdminRebuildNexusEnv()
+	ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+	defer cancel()
+
+	callbackInfoCh := make(chan adminRebuildNexusCallback, 1)
+	releaseStart := make(chan struct{})
+	endpointName := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(
+			handlerCtx context.Context,
+			_ string,
+			_ string,
+			_ *nexus.LazyValue,
+			options nexus.StartOperationOptions,
+		) (nexus.HandlerStartOperationResult[any], error) {
+			select {
+			case callbackInfoCh <- adminRebuildNexusCallback{
+				url:   options.CallbackURL,
+				token: options.CallbackHeader.Get(commonnexus.CallbackTokenHeader),
+			}:
+			default:
+			}
+			select {
+			case <-releaseStart:
+				return &nexus.HandlerStartOperationResultAsync{OperationToken: "test-operation-token"}, nil
+			case <-handlerCtx.Done():
+				return nil, handlerCtx.Err()
+			}
+		},
+	})
+
+	workflowFn := func(ctx workflow.Context) (string, error) {
+		client := workflow.NewNexusClient(endpointName, "service")
+		future := client.ExecuteOperation(ctx, "operation", "input", workflow.NexusOperationOptions{})
+		var result string
+		if err := future.Get(ctx, &result); err != nil {
+			return "", err
+		}
+		return result, nil
+	}
+	env.SdkWorker().RegisterWorkflow(workflowFn)
+
+	run, err := env.SdkClient().ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID:        testvars.New(s.T()).Any().String(),
+		TaskQueue: env.WorkerTaskQueue(),
+	}, workflowFn)
+	s.NoError(err)
+	callback := s.Rcv(callbackInfoCh)
+	execution := &commonpb.WorkflowExecution{WorkflowId: run.GetID(), RunId: run.GetRunID()}
+
+	history := env.GetHistory(env.Namespace().String(), execution)
+	s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED)
+	s.RequireNoHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_STARTED)
+	desc, err := env.SdkClient().DescribeWorkflowExecution(ctx, run.GetID(), run.GetRunID())
+	s.NoError(err)
+	s.Len(desc.PendingNexusOperations, 1)
+	s.Equal(enumspb.PENDING_NEXUS_OPERATION_STATE_SCHEDULED, desc.PendingNexusOperations[0].State)
+	s.assertAdminRebuildNexusOperationTree(ctx, env, execution, false)
+
+	s.rebuildAdminNexusOperationToHSM(ctx, env, execution)
+	s.assertAdminRebuildNexusOperationTree(ctx, env, execution, true)
+	close(releaseStart)
+
+	s.Await(func(s *AdminTestSuite) {
+		desc, err := env.SdkClient().DescribeWorkflowExecution(ctx, run.GetID(), run.GetRunID())
+		s.NoError(err)
+		s.Len(desc.PendingNexusOperations, 1)
+		s.Equal(enumspb.PENDING_NEXUS_OPERATION_STATE_STARTED, desc.PendingNexusOperations[0].State)
+	}, 10*time.Second, 50*time.Millisecond)
+	s.sendAdminRebuildNexusCompletion(ctx, callback, nexusrpc.CompleteOperationOptions{
+		Result: testcore.MustToPayload(s.T(), "result"),
+	})
+
+	var result string
+	s.NoError(run.Get(ctx, &result))
+	s.Equal("result", result)
+}
+
+func (s *AdminTestSuite) TestAdminRebuildMutableStateRealignsMultipleNexusOperationsToHSM(testWithChasm bool) {
+	if !testWithChasm {
+		s.T().Skip("test requires CHASM-backed Nexus operations before the rebuild")
+	}
+
+	const operationCount = 3
+	env := s.newAdminRebuildNexusEnv()
+	ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+	defer cancel()
+
+	callbackInfoCh := make(chan adminRebuildNexusCallback, operationCount)
+	endpointName := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(
+			_ context.Context,
+			_ string,
+			_ string,
+			_ *nexus.LazyValue,
+			options nexus.StartOperationOptions,
+		) (nexus.HandlerStartOperationResult[any], error) {
+			callbackInfoCh <- adminRebuildNexusCallback{
+				url:   options.CallbackURL,
+				token: options.CallbackHeader.Get(commonnexus.CallbackTokenHeader),
+			}
+			return &nexus.HandlerStartOperationResultAsync{OperationToken: options.RequestID}, nil
+		},
+	})
+
+	const awaitStartedUpdate = "await-all-started"
+	workflowFn := func(ctx workflow.Context) error {
+		started := false
+		if err := workflow.SetUpdateHandler(ctx, awaitStartedUpdate, func(ctx workflow.Context) error {
+			return workflow.Await(ctx, func() bool { return started })
+		}); err != nil {
+			return err
+		}
+
+		client := workflow.NewNexusClient(endpointName, "service")
+		futures := make([]workflow.NexusOperationFuture, 0, operationCount)
+		for range operationCount {
+			futures = append(futures, client.ExecuteOperation(ctx, "operation", "input", workflow.NexusOperationOptions{}))
+		}
+		for _, future := range futures {
+			var execution workflow.NexusOperationExecution
+			if err := future.GetNexusOperationExecution().Get(ctx, &execution); err != nil {
+				return err
+			}
+		}
+		started = true
+		for _, future := range futures {
+			if err := future.Get(ctx, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	env.SdkWorker().RegisterWorkflow(workflowFn)
+
+	run, err := env.SdkClient().ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID:        testvars.New(s.T()).Any().String(),
+		TaskQueue: env.WorkerTaskQueue(),
+	}, workflowFn)
+	s.NoError(err)
+	startedHandle, err := env.SdkClient().UpdateWorkflow(ctx, sdkclient.UpdateWorkflowOptions{
+		WorkflowID:   run.GetID(),
+		RunID:        run.GetRunID(),
+		UpdateName:   awaitStartedUpdate,
+		WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
+	})
+	s.NoError(err)
+	s.NoError(startedHandle.Get(ctx, nil))
+
+	callbacks := make([]adminRebuildNexusCallback, 0, operationCount)
+	for range operationCount {
+		callbacks = append(callbacks, s.Rcv(callbackInfoCh))
+	}
+	execution := &commonpb.WorkflowExecution{WorkflowId: run.GetID(), RunId: run.GetRunID()}
+	s.Len(s.assertAdminRebuildNexusOperationTrees(ctx, env, execution, false), operationCount)
+
+	s.rebuildAdminNexusOperationToHSM(ctx, env, execution)
+	s.Len(s.assertAdminRebuildNexusOperationTrees(ctx, env, execution, true), operationCount)
+	for _, callback := range callbacks {
+		s.sendAdminRebuildNexusCompletion(ctx, callback, nexusrpc.CompleteOperationOptions{
+			Result: testcore.MustToPayload(s.T(), "result"),
+		})
+	}
+	s.NoError(run.Get(ctx, nil))
+}
+
+func (s *AdminTestSuite) TestAdminRebuildMutableStateRealignsNexusOperationAfterCancellationRequest(testWithChasm bool) {
+	if !testWithChasm {
+		s.T().Skip("test requires a CHASM-backed Nexus operation before the rebuild")
+	}
+	s.testAdminRebuildMutableStateRealignsNexusCancellation(false)
+}
+
+func (s *AdminTestSuite) TestAdminRebuildMutableStateRealignsNexusCancellationInFlight(testWithChasm bool) {
+	if !testWithChasm {
+		s.T().Skip("test requires a CHASM-backed Nexus operation before the rebuild")
+	}
+	s.testAdminRebuildMutableStateRealignsNexusCancellation(true)
+}
+
+func (s *AdminTestSuite) testAdminRebuildMutableStateRealignsNexusCancellation(cancelInFlight bool) {
+	s.T().Helper()
+
+	env := s.newAdminRebuildNexusEnv()
+	ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+	defer cancel()
+
+	callbackInfoCh := make(chan adminRebuildNexusCallback, 1)
+	cancelHandled := make(chan struct{}, 1)
+	releaseCancel := make(chan struct{})
+	endpointName := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(
+			_ context.Context,
+			_ string,
+			_ string,
+			_ *nexus.LazyValue,
+			options nexus.StartOperationOptions,
+		) (nexus.HandlerStartOperationResult[any], error) {
+			select {
+			case callbackInfoCh <- adminRebuildNexusCallback{
+				url:   options.CallbackURL,
+				token: options.CallbackHeader.Get(commonnexus.CallbackTokenHeader),
+			}:
+			default:
+			}
+			return &nexus.HandlerStartOperationResultAsync{OperationToken: "test-operation-token"}, nil
+		},
+		OnCancelOperation: func(
+			handlerCtx context.Context,
+			_ string,
+			_ string,
+			_ string,
+			_ nexus.CancelOperationOptions,
+		) error {
+			select {
+			case cancelHandled <- struct{}{}:
+			default:
+			}
+			if !cancelInFlight {
+				return nil
+			}
+			select {
+			case <-releaseCancel:
+				return nil
+			case <-handlerCtx.Done():
+				return handlerCtx.Err()
+			}
+		},
+	})
+
+	const awaitStartedUpdate = "await-started"
+	workflowFn := func(ctx workflow.Context) error {
+		started := false
+		if err := workflow.SetUpdateHandler(ctx, awaitStartedUpdate, func(ctx workflow.Context) error {
+			return workflow.Await(ctx, func() bool { return started })
+		}); err != nil {
+			return err
+		}
+
+		client := workflow.NewNexusClient(endpointName, "service")
+		operationCtx, cancelOperation := workflow.WithCancel(ctx)
+		future := client.ExecuteOperation(operationCtx, "operation", "input", workflow.NexusOperationOptions{})
+		var execution workflow.NexusOperationExecution
+		if err := future.GetNexusOperationExecution().Get(ctx, &execution); err != nil {
+			return err
+		}
+		started = true
+
+		workflow.GetSignalChannel(ctx, "cancel").Receive(ctx, nil)
+		cancelOperation()
+		_ = future.Get(ctx, nil)
+		workflow.GetSignalChannel(ctx, "finish").Receive(ctx, nil)
+		return nil
+	}
+	env.SdkWorker().RegisterWorkflow(workflowFn)
+
+	run, err := env.SdkClient().ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID:        testvars.New(s.T()).Any().String(),
+		TaskQueue: env.WorkerTaskQueue(),
+	}, workflowFn)
+	s.NoError(err)
+	startedHandle, err := env.SdkClient().UpdateWorkflow(ctx, sdkclient.UpdateWorkflowOptions{
+		WorkflowID:   run.GetID(),
+		RunID:        run.GetRunID(),
+		UpdateName:   awaitStartedUpdate,
+		WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
+	})
+	s.NoError(err)
+	s.NoError(startedHandle.Get(ctx, nil))
+	callback := s.Rcv(callbackInfoCh)
+	s.NoError(env.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "cancel", nil))
+	s.Rcv(cancelHandled)
+
+	execution := &commonpb.WorkflowExecution{WorkflowId: run.GetID(), RunId: run.GetRunID()}
+	if cancelInFlight {
+		history := env.GetHistory(env.Namespace().String(), execution)
+		s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED)
+		s.RequireNoHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED)
+	} else {
+		s.Await(func(s *AdminTestSuite) {
+			history := env.GetHistory(env.Namespace().String(), execution)
+			s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED)
+			s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED)
+		}, 10*time.Second, 50*time.Millisecond)
+	}
+	s.assertAdminRebuildNexusOperationTree(ctx, env, execution, false)
+
+	s.rebuildAdminNexusOperationToHSM(ctx, env, execution)
+	s.assertAdminRebuildNexusOperationTree(ctx, env, execution, true)
+	if cancelInFlight {
+		close(releaseCancel)
+	}
+	// The old cancellation task response may be stale after a rebuild. The terminal callback is what must unblock the
+	// Workflow, and it must remain valid with the original CHASM completion token.
+	s.sendAdminRebuildNexusCompletion(ctx, callback, nexusrpc.CompleteOperationOptions{
+		Error: nexus.NewOperationCanceledErrorf("operation canceled"),
+	})
+	s.Await(func(s *AdminTestSuite) {
+		history := env.GetHistory(env.Namespace().String(), execution)
+		s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCELED)
+	}, 10*time.Second, 50*time.Millisecond)
+
+	s.NoError(env.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "finish", nil))
+	s.NoError(run.Get(ctx, nil))
+}
+
+func (s *AdminTestSuite) newAdminRebuildNexusEnv() *NexusTestEnv {
+	return newNexusTestEnv(
+		s.T(),
+		true,
+		testcore.WithDynamicConfig(dynamicconfig.EnableChasm, true),
+		testcore.WithDynamicConfig(dynamicconfig.EnableCHASMCallbacks, true),
+		testcore.WithDynamicConfig(chasmnexus.Enabled, true),
+		testcore.WithDynamicConfig(chasmnexus.EnableChasmWorkflowOperations, true),
+		testcore.WithDynamicConfig(chasmnexus.ChasmWorkflowOperationsRolloutPercent, 100),
+	)
+}
+
+func (s *AdminTestSuite) rebuildAdminNexusOperationToHSM(
+	ctx context.Context,
+	env *NexusTestEnv,
+	execution *commonpb.WorkflowExecution,
+) {
+	s.T().Helper()
+	// Keep the CHASM reader enabled but stop routing rebuilt operations to CHASM.
+	env.OverrideDynamicConfig(chasmnexus.ChasmWorkflowOperationsRolloutPercent, 0)
+	_, err := env.AdminClient().RebuildMutableState(ctx, &adminservice.RebuildMutableStateRequest{
+		Namespace: env.Namespace().String(),
+		Execution: execution,
+	})
+	s.NoError(err)
+}
+
+func (s *AdminTestSuite) sendAdminRebuildNexusCompletion(
+	ctx context.Context,
+	callback adminRebuildNexusCallback,
+	completion nexusrpc.CompleteOperationOptions,
+) {
+	s.T().Helper()
+	completion.Header = nexus.Header{commonnexus.CallbackTokenHeader: callback.token}
+	completionClient := nexusrpc.NewCompletionHTTPClient(nexusrpc.CompletionHTTPClientOptions{
+		Serializer: commonnexus.PayloadSerializer,
+	})
+	s.NoError(completionClient.CompleteOperation(ctx, callback.url, completion))
+}
+
+// assertAdminRebuildNexusOperationTree asserts which tree contains the pending operation and returns its event ID.
+func (s *AdminTestSuite) assertAdminRebuildNexusOperationTree(
+	ctx context.Context,
+	env *NexusTestEnv,
+	execution *commonpb.WorkflowExecution,
+	expectHSM bool,
+) string {
+	s.T().Helper()
+	opIDs := s.assertAdminRebuildNexusOperationTrees(ctx, env, execution, expectHSM)
+	s.Len(opIDs, 1)
+	return opIDs[0]
+}
+
+func (s *AdminTestSuite) assertAdminRebuildNexusOperationTrees(
+	ctx context.Context,
+	env *NexusTestEnv,
+	execution *commonpb.WorkflowExecution,
+	expectHSM bool,
+) []string {
+	s.T().Helper()
+	history := env.GetHistory(env.Namespace().String(), execution)
+	var opIDs []string
+	for _, event := range history {
+		if event.GetEventType() == enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED {
+			opIDs = append(opIDs, strconv.FormatInt(event.EventId, 10))
+		}
+	}
+	s.NotEmpty(opIDs)
+
+	desc, err := env.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+		Namespace: env.Namespace().String(),
+		Execution: execution,
+		Archetype: chasm.WorkflowArchetype,
+	})
+	s.NoError(err)
+	for _, opID := range opIDs {
+		_, inHSM := desc.DatabaseMutableState.GetExecutionInfo().
+			GetSubStateMachinesByType()[nexusoperations.OperationMachineType].GetMachinesById()[opID]
+		_, inCHASM := desc.DatabaseMutableState.GetChasmNodes()["Operations#"+opID]
+		s.Equal(expectHSM, inHSM, "unexpected HSM presence for operation %s", opID)
+		s.Equal(!expectHSM, inCHASM, "unexpected CHASM presence for operation %s", opID)
+	}
+	return opIDs
 }
 
 // TestAdminRebuildMutableStateRunTimeout checks that the rebuild re-anchors the run timeout
